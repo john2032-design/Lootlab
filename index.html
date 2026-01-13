@@ -1,0 +1,291 @@
+export function createLootApi(userConfig = {}) {
+  const DEFAULTS = {
+    ALLOWED_HOSTS: ['loot-link.com','loot-links.com','lootlink.org','lootlinks.co','lootdest.info','lootdest.org','lootdest.com','links-loot.com','linksloot.net'],
+    REDIRECT_STORE_KEY: 'vortix_redirects_v1',
+    INCENTIVE_SYNCER_DOMAIN: userConfig.INCENTIVE_SYNCER_DOMAIN || null,
+    INCENTIVE_SERVER_DOMAIN: userConfig.INCENTIVE_SERVER_DOMAIN || null,
+    KEY: userConfig.KEY || null,
+    TID: userConfig.TID || null,
+    API_BASE: (typeof userConfig.API_BASE !== 'undefined') ? userConfig.API_BASE : '',
+    logger: userConfig.logger || defaultLogger(),
+    storage: userConfig.storage || (typeof localStorage !== 'undefined' ? localStorage : null)
+  };
+
+  function defaultLogger() {
+    return {
+      log: (...args)=>console.log('[VortixLoot]', ...args),
+      info: (...args)=>console.info('[VortixLoot]', ...args),
+      warn: (...args)=>console.warn('[VortixLoot]', ...args),
+      error: (...args)=>console.error('[VortixLoot]', ...args)
+    };
+  }
+
+  const cfg = Object.assign({}, DEFAULTS, userConfig);
+  const storage = cfg.storage;
+  function loadRedirectMap() {
+    if (!storage) return {};
+    try {
+      const raw = storage.getItem(cfg.REDIRECT_STORE_KEY);
+      if (!raw) return {};
+      return JSON.parse(raw);
+    } catch (e) {
+      cfg.logger.warn('Could not parse redirect map', e);
+      return {};
+    }
+  }
+  function saveRedirectMap(map) {
+    if (!storage) {
+      cfg.logger.warn('saveRedirectMap: storage not available; skipping save.');
+      return false;
+    }
+    try {
+      storage.setItem(cfg.REDIRECT_STORE_KEY, JSON.stringify(map));
+      cfg.logger.info('Redirect map saved.');
+      return true;
+    } catch (e) {
+      cfg.logger.error('Failed to save redirect map.', e);
+      return false;
+    }
+  }
+  function saveRedirectMapping(lootUrl, destUrl) {
+    try {
+      const map = loadRedirectMap();
+      const key = encodeURIComponent(lootUrl);
+      map[key] = destUrl;
+      saveRedirectMap(map);
+      cfg.logger.info(`Saved redirect mapping: ${lootUrl} -> ${destUrl}`);
+      return true;
+    } catch (e) {
+      cfg.logger.error('Error saving mapping', e);
+      return false;
+    }
+  }
+  function getRedirectFor(lootUrl) {
+    try {
+      const map = loadRedirectMap();
+      const key = encodeURIComponent(lootUrl);
+      return map[key] || null;
+    } catch (e) {
+      cfg.logger.error('Error reading mapping', e);
+      return null;
+    }
+  }
+  function decodeURIxor(encodedString, prefixLength = 5) {
+    if (typeof atob !== 'function') {
+      throw new Error('decodeURIxor requires atob (browser environment).');
+    }
+    let decodedString = '';
+    const base64Decoded = atob(encodedString);
+    const prefix = base64Decoded.substring(0, prefixLength);
+    const encodedPortion = base64Decoded.substring(prefixLength);
+    for (let i = 0; i < encodedPortion.length; i++) {
+      const encodedChar = encodedPortion.charCodeAt(i);
+      const prefixChar = prefix.charCodeAt(i % prefix.length);
+      const decodedChar = encodedChar ^ prefixChar;
+      decodedString += String.fromCharCode(decodedChar);
+    }
+    return decodedString;
+  }
+
+  async function callBypassApi(finalUrl, elapsedSeconds) {
+    const base = (cfg.API_BASE || '').replace(/\/+$/,'');
+    const apiUrl = (base === '') ? `/bypass?url=${encodeURIComponent(finalUrl)}` : `${base}/bypass?url=${encodeURIComponent(finalUrl)}`;
+    let resultObj = { result: null, Time: (elapsedSeconds !== null ? elapsedSeconds.toFixed(2) : '0.00'), Status: 'Error' };
+    try {
+      const resp = await fetch(apiUrl, { method: 'GET' });
+      let text = null;
+      try { text = await resp.text(); } catch(e){}
+      if (resp.ok) {
+        resultObj.result = finalUrl;
+        resultObj.Time = (elapsedSeconds !== null ? elapsedSeconds.toFixed(2) : '0.00');
+        resultObj.Status = 'Success';
+        console.log('result', resultObj.result);
+        console.log('Time', resultObj.Time);
+        console.log('Success');
+        return resultObj;
+      } else {
+        resultObj.result = null;
+        resultObj.Time = (elapsedSeconds !== null ? elapsedSeconds.toFixed(2) : '0.00');
+        resultObj.Status = 'Error';
+        console.log('result', resultObj.result);
+        console.log('Time', resultObj.Time);
+        console.log('Error');
+        return resultObj;
+      }
+    } catch (e) {
+      resultObj.result = null;
+      resultObj.Time = (elapsedSeconds !== null ? elapsedSeconds.toFixed(2) : '0.00');
+      resultObj.Status = 'Error';
+      console.log('result', resultObj.result);
+      console.log('Time', resultObj.Time);
+      console.log('Error');
+      return resultObj;
+    }
+  }
+
+  function setupFetchInterceptor(options = {}) {
+    const win = options.win || (typeof window !== 'undefined' ? window : null);
+    if (!win) throw new Error('setupFetchInterceptor requires a window-like object');
+    const originalFetch = win.fetch.bind(win);
+    const INC_SYNC = cfg.INCENTIVE_SYNCER_DOMAIN;
+    const INC_SRV = cfg.INCENTIVE_SERVER_DOMAIN;
+    const KEY = cfg.KEY;
+    const TID = cfg.TID;
+    if (!INC_SYNC || !INC_SRV) {
+      cfg.logger.warn('setupFetchInterceptor: missing INCENTIVE_SYNCER_DOMAIN or INCENTIVE_SERVER_DOMAIN in config. Interceptor will not be installed.');
+      return { enabled: false, restore: ()=>{} };
+    }
+    let lastStartTime = null;
+    win.fetch = function(input, init) {
+      try {
+        const urlStr = (typeof input === 'string') ? input : (input && input.url) ? input.url : '';
+        if (urlStr && urlStr.includes(`${INC_SYNC}/tc`)) {
+          lastStartTime = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+          cfg.logger.log('Intercepting incentive syncer fetch:', urlStr);
+          return originalFetch(input, init).then(response => {
+            if (!response.ok) return response;
+            return response.clone().json().then(data => {
+              try {
+                let urid = '';
+                let task_id = '';
+                let action_pixel_url = '';
+                if (Array.isArray(data)) {
+                  data.forEach(item => {
+                    if (!urid && item.urid) urid = item.urid;
+                    task_id = 54;
+                    if (!action_pixel_url && item.action_pixel_url) action_pixel_url = item.action_pixel_url;
+                  });
+                } else if (data && typeof data === 'object') {
+                  urid = data.urid || '';
+                  task_id = data.task_id || 54;
+                  action_pixel_url = data.action_pixel_url || '';
+                }
+                if (urid) {
+                  try {
+                    const wsShard = (urid.substr(-5) % 3);
+                    const wsUrl = `wss://${wsShard}.${INC_SRV}/c?uid=${encodeURIComponent(urid)}&cat=${encodeURIComponent(task_id)}&key=${encodeURIComponent(KEY||'')}`;
+                    cfg.logger.info('Opening WebSocket to', wsUrl);
+                    if (typeof win.WebSocket === 'function') {
+                      const ws = new win.WebSocket(wsUrl);
+                      let publisherLink = null;
+                      ws.onopen = () => {
+                        try { ws._vortix_ping = setInterval(()=> { try { ws.send('0'); } catch(e){} }, 1000); } catch (e) {}
+                        try {
+                          if (typeof navigator !== 'undefined' && typeof navigator.sendBeacon === 'function') {
+                            navigator.sendBeacon(`https://${wsShard}.${INC_SRV}/st?uid=${encodeURIComponent(urid)}&cat=${encodeURIComponent(task_id)}`);
+                          }
+                        } catch (e) {}
+                      };
+                      ws.onmessage = (event) => {
+                        try {
+                          const d = event && event.data;
+                          if (d && typeof d === 'string' && d.includes('r:')) {
+                            publisherLink = d.replace('r:', '');
+                            cfg.logger.info('PUBLISHER_LINK received via WS (raw)', publisherLink);
+                          }
+                        } catch (e) {
+                          cfg.logger.warn('ws.onmessage parse error', e);
+                        }
+                      };
+                      ws.onclose = () => {
+                        try { clearInterval(ws._vortix_ping); } catch(e){}
+                        try {
+                          const now = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+                          const elapsedMs = (lastStartTime !== null) ? (now - lastStartTime) : 0;
+                          const elapsedSeconds = elapsedMs / 1000;
+                          if (publisherLink) {
+                            let finalUrl = publisherLink;
+                            try { finalUrl = decodeURIComponent(decodeURIxor(publisherLink)); } catch (innerErr) {
+                              cfg.logger.warn('Could not decode publisherLink with decodeURIxor, using raw value', innerErr);
+                              try { finalUrl = decodeURIComponent(publisherLink); } catch(e){}
+                            }
+                            try { saveRedirectMapping(win.location.href, finalUrl); } catch(e){ cfg.logger.warn('saveRedirectMapping failed', e); }
+                            if (typeof options.onRedirectReady === 'function') {
+                              options.onRedirectReady(finalUrl, { urid, task_id, publisherLink, elapsedSeconds });
+                            }
+                            if (options.autoCallApi === true) {
+                              callBypassApi(finalUrl, elapsedSeconds);
+                            }
+                          } else {
+                            if (typeof options.onRedirectReady === 'function') {
+                              options.onRedirectReady(null, { urid, task_id, publisherLink: null, elapsedSeconds });
+                            }
+                            if (options.autoCallApi === true) {
+                              callBypassApi(null, elapsedSeconds);
+                            }
+                          }
+                        } catch (e) {
+                          cfg.logger.error('Error during ws.onclose handling', e);
+                        }
+                      };
+                    } else {
+                      cfg.logger.warn('WebSocket not available in this environment; skipping ws flow.');
+                      const now = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+                      const elapsedMs = (lastStartTime !== null) ? (now - lastStartTime) : 0;
+                      const elapsedSeconds = elapsedMs / 1000;
+                      if (typeof options.onRedirectReady === 'function') {
+                        options.onRedirectReady(null, { urid, task_id, publisherLink: null, elapsedSeconds });
+                      }
+                      if (options.autoCallApi === true) {
+                        callBypassApi(null, elapsedSeconds);
+                      }
+                    }
+                  } catch (e) {
+                    cfg.logger.error('WebSocket handling failed', e);
+                  }
+                } else {
+                  cfg.logger.warn('No URID found in incentive response JSON; cannot continue WS flow.');
+                }
+              } catch (e) {
+                cfg.logger.warn('Error processing incentive JSON', e);
+              }
+              return new Response(JSON.stringify(data), {
+                status: response.status,
+                statusText: response.statusText,
+                headers: response.headers
+              });
+            }).catch(err => {
+              cfg.logger.warn('Failed to parse incentive fetch JSON', err);
+              return response;
+            });
+          }).catch(err => {
+            cfg.logger.warn('Original fetch for incentive endpoint failed', err);
+            return originalFetch(input, init);
+          });
+        }
+      } catch (e) {
+        cfg.logger.error('Error in fetch interceptor check', e);
+      }
+      return originalFetch(input, init);
+    };
+    cfg.logger.info('Fetch interceptor installed for domain:', INC_SYNC);
+    function restore() {
+      try {
+        if (win.fetch && win.fetch !== originalFetch) {
+          win.fetch = originalFetch;
+          cfg.logger.info('Fetch restored to original.');
+        }
+      } catch (e) {
+        cfg.logger.warn('Failed to restore fetch', e);
+      }
+    }
+    return { enabled: true, restore };
+  }
+
+  function isLootHost(hostname) {
+    if (!hostname) return false;
+    return cfg.ALLOWED_HOSTS.includes(hostname);
+  }
+
+  return {
+    cfg,
+    isLootHost,
+    loadRedirectMap,
+    saveRedirectMap,
+    getRedirectFor,
+    saveRedirectMapping,
+    decodeURIxor,
+    setupFetchInterceptor,
+    callBypassApi
+  };
+}
